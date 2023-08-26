@@ -41,9 +41,7 @@ jobs:
         uses: docker/metadata-action@v4
         with:
           images: |
-            ghcr.io/nginx-proxy/docker-gen
-            nginxproxy/docker-gen
-            jwilder/docker-gen
+            ghcr.io/tarasov65536/docker-gen
           tags: |
             type=semver,pattern={{version}},enable=${{ matrix.base == 'alpine' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.base == 'alpine' }}
