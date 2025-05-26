@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/url"
 	"os"
@@ -13,7 +14,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"syscall"
 	"text/template"
 	"unicode"
 
@@ -58,46 +58,66 @@ func newTemplate(name string) *template.Template {
 		}
 		return buf.String(), nil
 	}
-	tmpl.Funcs(sprig.TxtFuncMap()).Funcs(template.FuncMap{
-		"closest":                arrayClosest,
-		"coalesce":               coalesce,
-		"contains":               contains,
-		"dir":                    dirList,
-		"eval":                   eval,
-		"exists":                 utils.PathExists,
-		"groupBy":                groupBy,
-		"groupByKeys":            groupByKeys,
-		"groupByMulti":           groupByMulti,
-		"groupByLabel":           groupByLabel,
-		"json":                   marshalJson,
-		"intersect":              intersect,
-		"keys":                   keys,
-		"replace":                strings.Replace,
-		"parseBool":              strconv.ParseBool,
-		"parseJson":              unmarshalJson,
-		"queryEscape":            url.QueryEscape,
-		"sha1":                   hashSha1,
-		"split":                  strings.Split,
-		"splitN":                 strings.SplitN,
-		"sortStringsAsc":         sortStringsAsc,
-		"sortStringsDesc":        sortStringsDesc,
-		"sortObjectsByKeysAsc":   sortObjectsByKeysAsc,
-		"sortObjectsByKeysDesc":  sortObjectsByKeysDesc,
-		"trimPrefix":             trimPrefix,
-		"trimSuffix":             trimSuffix,
-		"toLower":                toLower,
-		"toUpper":                toUpper,
-		"when":                   when,
-		"where":                  where,
-		"whereNot":               whereNot,
-		"whereExist":             whereExist,
-		"whereNotExist":          whereNotExist,
-		"whereAny":               whereAny,
-		"whereAll":               whereAll,
-		"whereLabelExists":       whereLabelExists,
-		"whereLabelDoesNotExist": whereLabelDoesNotExist,
-		"whereLabelValueMatches": whereLabelValueMatches,
+
+	sprigFuncMap := sprig.TxtFuncMap()
+
+	tmpl.Funcs(sprigFuncMap).Funcs(template.FuncMap{
+		"closest":                 arrayClosest,
+		"coalesce":                coalesce,
+		"comment":                 comment,
+		"contains":                contains,
+		"dir":                     dirList,
+		"eval":                    eval,
+		"exists":                  utils.PathExists,
+		"groupBy":                 groupBy,
+		"groupByWithDefault":      groupByWithDefault,
+		"groupByKeys":             groupByKeys,
+		"groupByMulti":            groupByMulti,
+		"groupByLabel":            groupByLabel,
+		"groupByLabelWithDefault": groupByLabelWithDefault,
+		"include":                 include,
+		"intersect":               intersect,
+		"keys":                    keys,
+		"replace":                 strings.Replace,
+		"parseBool":               strconv.ParseBool,
+		"fromYaml":                fromYaml,
+		"toYaml":                  toYaml,
+		"mustFromYaml":            mustFromYaml,
+		"mustToYaml":              mustToYaml,
+		"queryEscape":             url.QueryEscape,
+		"split":                   strings.Split,
+		"splitN":                  strings.SplitN,
+		"sortStringsAsc":          sortStringsAsc,
+		"sortStringsDesc":         sortStringsDesc,
+		"sortObjectsByKeysAsc":    sortObjectsByKeysAsc,
+		"sortObjectsByKeysDesc":   sortObjectsByKeysDesc,
+		"toLower":                 strings.ToLower,
+		"toUpper":                 strings.ToUpper,
+		"when":                    when,
+		"where":                   where,
+		"whereNot":                whereNot,
+		"whereExist":              whereExist,
+		"whereNotExist":           whereNotExist,
+		"whereAny":                whereAny,
+		"whereAll":                whereAll,
+		"whereLabelExists":        whereLabelExists,
+		"whereLabelDoesNotExist":  whereLabelDoesNotExist,
+		"whereLabelValueMatches":  whereLabelValueMatches,
+
+		// legacy docker-gen template function aliased to their Sprig clone
+		"json":      sprigFuncMap["mustToJson"],
+		"parseJson": sprigFuncMap["mustFromJson"],
+		"sha1":      sprigFuncMap["sha1sum"],
+
+		// aliases to sprig template functions masked by docker-gen functions with the same name
+		"sprigCoalesce": sprigFuncMap["coalesce"],
+		"sprigContains": sprigFuncMap["contains"],
+		"sprigDir":      sprigFuncMap["dir"],
+		"sprigReplace":  sprigFuncMap["replace"],
+		"sprigSplit":    sprigFuncMap["split"],
+		"sprigSplitn":   sprigFuncMap["splitn"],
 	})
+
 	return tmpl
 }
 
@@ -171,47 +191,17 @@ func GenerateFile(config config.Config, containers context.Context) bool {
 	}
 
 	if config.Dest != "" {
-		dest, err := os.CreateTemp(filepath.Dir(config.Dest), "docker-gen")
-		defer func() {
-			dest.Close()
-			os.Remove(dest.Name())
-		}()
-		if err != nil {
-			log.Fatalf("Unable to create temp file: %s\n", err)
-		}
-
-		if n, err := dest.Write(contents); n != len(contents) || err != nil {
-			log.Fatalf("Failed to write to temp file: wrote %d, exp %d, err=%v", n, len(contents), err)
-		}
-
-		oldContents := []byte{}
-		if fi, err := os.Stat(config.Dest); err == nil || os.IsNotExist(err) {
-			if err != nil && os.IsNotExist(err) {
-				emptyFile, err := os.Create(config.Dest)
-				if err != nil {
-					log.Fatalf("Unable to create empty destination file: %s\n", err)
-				} else {
-					emptyFile.Close()
-					fi, _ = os.Stat(config.Dest)
-				}
-			}
-			if err := dest.Chmod(fi.Mode()); err != nil {
-				log.Fatalf("Unable to chmod temp file: %s\n", err)
-			}
-			if err := dest.Chown(int(fi.Sys().(*syscall.Stat_t).Uid), int(fi.Sys().(*syscall.Stat_t).Gid)); err != nil {
-				log.Fatalf("Unable to chown temp file: %s\n", err)
-			}
-			oldContents, err = os.ReadFile(config.Dest)
-			if err != nil {
-				log.Fatalf("Unable to compare current file contents: %s: %s\n", config.Dest, err)
-			}
+		oldContents, err := os.ReadFile(config.Dest)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			log.Fatalf("Unable to compare current file contents: %s: %s\n", config.Dest, err)
 		}
 
 		if !bytes.Equal(oldContents, contents) {
-			err = os.Rename(dest.Name(), config.Dest)
+			err := os.WriteFile(config.Dest, contents, 0644)
 			if err != nil {
-				log.Fatalf("Unable to create dest file %s: %s\n", config.Dest, err)
+				log.Fatalf("Unable to write to dest file %s: %s\n", config.Dest, err)
 			}
+
 			log.Printf("Generated '%s' from %d containers", config.Dest, len(filteredContainers))
 			return true
 		}
@@ -223,13 +213,14 @@ func GenerateFile(config config.Config, containers context.Context) bool {
 }
 
 func executeTemplate(templatePath string, containers context.Context) []byte {
-	tmpl, err := newTemplate(filepath.Base(templatePath)).ParseFiles(templatePath)
+	templatePathList := strings.Split(templatePath, ";")
+	tmpl, err := newTemplate(filepath.Base(templatePath)).ParseFiles(templatePathList...)
 	if err != nil {
 		log.Fatalf("Unable to parse template: %s", err)
 	}
 
 	buf := new(bytes.Buffer)
-	err = tmpl.ExecuteTemplate(buf, filepath.Base(templatePath), &containers)
+	err = tmpl.ExecuteTemplate(buf, filepath.Base(templatePathList[0]), &containers)
 	if err != nil {
 		log.Fatalf("Template error: %s\n", err)
 	}
